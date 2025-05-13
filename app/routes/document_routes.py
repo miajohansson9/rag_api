@@ -160,19 +160,15 @@ def get_cached_query_embedding(query: str):
 @router.post("/query")
 async def query_embeddings_by_file_id(
     body: QueryRequestBody,
-    request: Request,
 ):
-    if not hasattr(request.state, "user"):
-        user_authorized = body.entity_id if body.entity_id else "public"
-    else:
-        user_authorized = (
-            body.entity_id if body.entity_id else request.state.user.get("id")
-        )
-
-    authorized_documents = []
-
     try:
         embedding = get_cached_query_embedding(body.query)
+
+        filter = {}
+        if body.file_id:
+            filter = {"file_id": body.file_id}
+        else:
+            filter = {"entity_id": body.entity_id}
 
         if isinstance(vector_store, AsyncPgVector):
             documents = await run_in_executor(
@@ -180,43 +176,14 @@ async def query_embeddings_by_file_id(
                 vector_store.similarity_search_with_score_by_vector,
                 embedding,
                 k=body.k,
-                filter={"file_id": body.file_id},
+                filter=filter,
             )
         else:
             documents = vector_store.similarity_search_with_score_by_vector(
-                embedding, k=body.k, filter={"file_id": body.file_id}
+                embedding, k=body.k, filter=filter
             )
 
-        if not documents:
-            return authorized_documents
-
-        document, score = documents[0]
-        doc_metadata = document.metadata
-        doc_user_id = doc_metadata.get("user_id")
-
-        if doc_user_id is None or doc_user_id == user_authorized:
-            authorized_documents = documents
-        else:
-            # If using entity_id and access denied, try again with user's actual ID
-            if body.entity_id and hasattr(request.state, "user"):
-                user_authorized = request.state.user.get("id")
-                if doc_user_id == user_authorized:
-                    authorized_documents = documents
-                else:
-                    if body.entity_id == doc_user_id:
-                        logger.warning(
-                            f"Entity ID {body.entity_id} matches document user_id but user {user_authorized} is not authorized"
-                        )
-                    else:
-                        logger.warning(
-                            f"Access denied for both entity ID {body.entity_id} and user {user_authorized} to document with user_id {doc_user_id}"
-                        )
-            else:
-                logger.warning(
-                    f"Unauthorized access attempt by user {user_authorized} to a document with user_id {doc_user_id}"
-                )
-
-        return authorized_documents
+        return documents
 
     except HTTPException as http_exc:
         logger.error(
@@ -227,8 +194,9 @@ async def query_embeddings_by_file_id(
         raise http_exc
     except Exception as e:
         logger.error(
-            "Error in query embeddings | File ID: %s | Query: %s | Error: %s | Traceback: %s",
+            "Error in query embeddings | File ID: %s | Entity ID: %s | Query: %s | Error: %s | Traceback: %s",
             body.file_id,
+            body.entity_id,
             body.query,
             str(e),
             traceback.format_exc(),
@@ -245,6 +213,7 @@ async def store_data_in_vector_db(
     data: Iterable[Document],
     file_id: str,
     user_id: str = "",
+    entity_id: str = "",
     clean_content: bool = False,
 ) -> bool:
     text_splitter = RecursiveCharacterTextSplitter(
@@ -264,6 +233,7 @@ async def store_data_in_vector_db(
             metadata={
                 "file_id": file_id,
                 "user_id": user_id,
+                "entity_id": entity_id,
                 "digest": generate_digest(doc.page_content),
                 **(doc.metadata or {}),
             },
@@ -303,17 +273,14 @@ async def embed_local_file(
             detail=ERROR_MESSAGES.FILE_NOT_FOUND,
         )
 
-    if not hasattr(request.state, "user"):
-        user_id = entity_id if entity_id else "public"
-    else:
-        user_id = entity_id if entity_id else request.state.user.get("id")
+    user_id = request.state.user.get("id")
 
     try:
         loader, known_type = get_loader(
             document.filename, document.file_content_type, document.filepath
         )
         data = loader.load()
-        result = await store_data_in_vector_db(data, document.file_id, user_id)
+        result = await store_data_in_vector_db(data, document.file_id, user_id, entity_id)
 
         if result:
             return {
@@ -321,6 +288,7 @@ async def embed_local_file(
                 "file_id": document.file_id,
                 "filename": document.filename,
                 "known_type": known_type,
+                "entity_id": entity_id,
             }
         else:
             raise HTTPException(
@@ -358,14 +326,10 @@ async def embed_file(
     response_status = True
     response_message = "File processed successfully."
     known_type = None
-    if not hasattr(request.state, "user"):
-        user_id = entity_id if entity_id else "public"
-    else:
-        user_id = entity_id if entity_id else request.state.user.get("id")
 
-    temp_base_path = os.path.join(RAG_UPLOAD_DIR, user_id)
+    temp_base_path = os.path.join(RAG_UPLOAD_DIR, entity_id)
     os.makedirs(temp_base_path, exist_ok=True)
-    temp_file_path = os.path.join(RAG_UPLOAD_DIR, user_id, file.filename)
+    temp_file_path = os.path.join(RAG_UPLOAD_DIR, entity_id, file.filename)
 
     try:
         async with aiofiles.open(temp_file_path, "wb") as temp_file:
@@ -390,7 +354,7 @@ async def embed_file(
         )
         data = loader.load()
         result = await store_data_in_vector_db(
-            data=data, file_id=file_id, user_id=user_id, clean_content=file_ext == "pdf"
+            data=data, file_id=file_id, entity_id=entity_id, user_id=request.state.user.get("id"), clean_content=file_ext == "pdf"
         )
 
         if not result:
@@ -446,6 +410,8 @@ async def embed_file(
         "status": response_status,
         "message": response_message,
         "file_id": file_id,
+        "entity_id": entity_id,
+        "user_id": request.state.user.get("id"),
         "filename": file.filename,
         "known_type": known_type,
     }

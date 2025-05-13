@@ -28,9 +28,10 @@ class StoreDocument(BaseModel):
 
 class QueryRequestBody(BaseModel):
     query: str
-    file_id: str
+    file_id: Optional[str] = None
     k: int = 4
     entity_id: Optional[str] = None
+    user_id: Optional[str] = None
 
 
 class CleanupMethod(str, Enum):
